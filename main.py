@@ -3,20 +3,18 @@ import requests
 import pandas as pd
 from bs4 import BeautifulSoup
 from datetime import datetime, timezone, timedelta
+import os
 
-# =============== 配置 ===============
-SEND_KEY = "SCT297231TGsz16Tw7UQi0ggOte9Yc36ue"
-# ===================================
+# ====== Server酱 KEY，从 GitHub Secrets 获取 ======
+SEND_KEY = os.environ.get("SERVER_CHAN_KEY")
 
 def get_percentile(series, value):
-    """计算百分位"""
     try:
         return round((series < value).mean() * 100, 1)
     except Exception:
         return None
 
 def fetch_yahoo_data():
-    """获取价格和百分位（带兜底）"""
     data = {}
     tickers = {
         "SPY": ("SPY", "10y"),
@@ -24,7 +22,6 @@ def fetch_yahoo_data():
         "BTC": ("BTC-USD", "5y"),
         "VIX": ("^VIX", "5y"),
     }
-
     for name, (ticker, period) in tickers.items():
         try:
             tk = yf.Ticker(ticker)
@@ -34,26 +31,22 @@ def fetch_yahoo_data():
             data[name] = (price, pct)
         except Exception:
             data[name] = ("获取失败", None)
-
     return data
 
 def fetch_multpl_data():
-    """抓取 SP500 最新 PE 和 CAPE（直接抓表格 + 百分位）"""
     results = {}
     urls = {
         "PE": "https://www.multpl.com/s-p-500-pe-ratio/table",
         "CAPE": "https://www.multpl.com/shiller-pe/table"
     }
-
     for key, url in urls.items():
         try:
             r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
             soup = BeautifulSoup(r.text, "html.parser")
-
             table = soup.find("table", {"class":"datatable"})
             history = []
             if table:
-                rows = table.find_all("tr")[1:]  # 跳过表头
+                rows = table.find_all("tr")[1:]
                 for row in rows:
                     cols = row.find_all("td")
                     if len(cols) >= 2:
@@ -61,22 +54,18 @@ def fetch_multpl_data():
                             history.append(float(cols[1].text.strip().replace(",","")))
                         except:
                             continue
-
             if history:
-                value = round(history[0],2)  # 表格第一行是最新值
+                value = round(history[0],2)
                 series = pd.Series(history)
                 pct = get_percentile(series, value)
                 results[key] = {"val": value, "pct": pct}
             else:
                 results[key] = {"val": "获取失败", "pct": None}
-
         except Exception:
             results[key] = {"val": "获取失败", "pct": None}
-
     return results
 
 def send_wechat(content):
-    """Server酱推送"""
     url = f"https://sctapi.ftqq.com/{SEND_KEY}.send"
     try:
         requests.post(url, data={
@@ -87,19 +76,13 @@ def send_wechat(content):
         print("微信推送失败")
 
 if __name__ == "__main__":
-    # 日期（北京时间）
-    today = datetime.now(timezone.utc).astimezone(
-        timezone(timedelta(hours=8))
-    ).strftime("%Y/%m/%d")
-
-    # 数据获取
+    today = datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=8))).strftime("%Y/%m/%d")
     data = fetch_yahoo_data()
     pe_data = fetch_multpl_data()
 
-    # ========== 拼接 Markdown 消息 ==========
     msg = f"**{today} 最新美股与比特币价格：**\n\n"
 
-    # 美股指数
+    # 美股
     spy_price, spy_pct = data['SPY']
     qqq_price, qqq_pct = data['QQQ']
     msg += "📈 **美股指数**\n"
