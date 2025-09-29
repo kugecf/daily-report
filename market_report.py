@@ -139,6 +139,11 @@ def save_market_log(today, data):
         writer.writerow(row)
 
 
+def format_pct(val):
+    """格式化百分比，如果是 None 返回空字符串"""
+    return f"（{val:.1f}%）" if val is not None else ""
+
+
 if __name__ == "__main__":
     today = datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=8))).strftime("%Y/%m/%d")
     data = fetch_yahoo_data()
@@ -151,26 +156,27 @@ if __name__ == "__main__":
     msg += "📈 **美股指数**\n"
     for idx in ["SPY", "QQQ"]:
         price, high, ratio, pct = data[idx]["price"], data[idx]["high"], data[idx]["ratio"], data[idx]["pct"]
-        msg += f"- {idx}: {price:.2f} (最高 {high:.2f}, 当前/最高 {ratio:.1f}%)"
-        msg += f" （{pct:.1f}%）\n"
+        msg += f"- {idx}: {price if isinstance(price, str) else f'{price:.2f}'} (最高 {high if high else '-'} , 当前/最高 {ratio if ratio else '-'}%)"
+        msg += f" {format_pct(pct)}\n"
 
     # ===== BTC =====
     btc = data["BTC"]
     msg += "\n💰 **比特币**\n"
-    msg += f"- BTC: {btc['price']:.2f} (最高 {btc['high']:.2f}, 当前/最高 {btc['ratio']:.1f}%)"
-    msg += f" （{btc['pct']:.1f}%）\n"
+    msg += f"- BTC: {btc['price'] if isinstance(btc['price'], str) else f'{btc['price']:.2f}'} (最高 {btc['high'] if btc['high'] else '-'} , 当前/最高 {btc['ratio'] if btc['ratio'] else '-'}%)"
+    msg += f" {format_pct(btc['pct'])}\n"
 
     # ===== VIX =====
     vix = data["VIX"]
     msg += "\n🌪 **波动率指数**\n"
-    msg += f"- VIX: {vix['price']:.2f}\n"
+    msg += f"- VIX: {vix['price'] if isinstance(vix['price'], str) else f'{vix['price']:.2f}'}\n"
 
     # ===== 估值指标 =====
     pe_val, pe_pct = pe_data['PE']["val"], pe_data['PE']["pct"]
     cape_val, cape_pct = pe_data['CAPE']["val"], pe_data['CAPE']["pct"]
+
     msg += "\n📊 **估值指标**\n"
-    msg += f"- S&P500 PE: {pe_val} （{pe_pct:.1f}%）\n"
-    msg += f"- S&P500 CAPE: {cape_val} （{cape_pct:.1f}%）\n\n"
+    msg += f"- S&P500 PE: {pe_val} {format_pct(pe_pct)}\n"
+    msg += f"- S&P500 CAPE: {cape_val} {format_pct(cape_pct)}\n\n"
 
     # ===== 检查提醒条件 =====
     alert_msg = ""
