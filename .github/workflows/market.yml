@@ -5,29 +5,48 @@ on:
     - cron: '0 2 * * *'   # 每天 UTC 2:00 运行，相当于北京时间 10:00
   workflow_dispatch:       # 允许手动触发
 
+# === 关键修复：允许 Actions 有写入权限 ===
+permissions:
+  contents: write
+
 jobs:
   run-script:
     runs-on: ubuntu-latest
 
     steps:
+    # === 1. 拉取代码仓库 ===
     - name: Checkout repository
       uses: actions/checkout@v3
 
+    # === 2. 设置 Python 环境 ===
     - name: Set up Python
       uses: actions/setup-python@v4
       with:
         python-version: '3.10'
 
+    # === 3. 安装依赖 ===
     - name: Install dependencies
       run: |
         pip install -r requirements.txt
 
+    # === 4. 运行主脚本（market_report.py） ===
     - name: Run market report
       env:
         SERVER_CHAN_KEY: ${{ secrets.SERVER_CHAN_KEY }}
       run: |
         python market_report.py
 
+    # === 5. 输出调试信息（可选） ===
+    - name: Debug Python output
+      run: |
+        echo "Python 版本："
+        python --version
+        echo "当前文件列表："
+        ls -lh
+        echo "检查日志文件内容（如存在）:"
+        cat market_log.csv || echo "未找到 market_log.csv"
+
+    # === 6. 提交并推送日志文件 ===
     - name: Commit log files
       run: |
         git config --global user.name "github-actions[bot]"
@@ -35,13 +54,3 @@ jobs:
         git add market_log.csv alerts.json || true
         git commit -m "Update market log" || echo "No changes to commit"
         git push
-        
-    - name: Debug Python output
-      run: |
-        echo "Check Python version:"
-        python --version
-        echo "List files:"
-        ls -l
-        echo "Check logs:"
-        cat market_log.csv || echo "No market_log.csv"
-
