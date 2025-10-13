@@ -35,3 +35,13 @@ jobs:
         git add market_log.csv alerts.json || true
         git commit -m "Update market log" || echo "No changes to commit"
         git push
+        
+    - name: Debug Python output
+      run: |
+        echo "Check Python version:"
+        python --version
+        echo "List files:"
+        ls -l
+        echo "Check logs:"
+        cat market_log.csv || echo "No market_log.csv"
+
