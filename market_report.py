@@ -3,9 +3,7 @@ import requests
 import pandas as pd
 from bs4 import BeautifulSoup
 from datetime import datetime, timezone, timedelta
-import os
-import json
-import csv
+import os, json, csv, traceback, time
 
 # ====== Server酱 KEY，从 GitHub Secrets 获取 ======
 SEND_KEY = os.environ.get("SERVER_CHAN_KEY")
@@ -14,6 +12,8 @@ SEND_KEY = os.environ.get("SERVER_CHAN_KEY")
 ALERT_FILE = "alerts.json"
 # 保存市场日志的文件
 LOG_FILE = "market_log.csv"
+# multpl 数据缓存
+CACHE_FILE = "multpl_cache.json"
 
 
 def get_percentile(series, value):
@@ -36,86 +36,101 @@ def fetch_yahoo_data():
         try:
             tk = yf.Ticker(ticker)
             hist = tk.history(period=period)["Close"]
+            if hist.empty:
+                raise ValueError("empty data")
             price = round(hist.iloc[-1], 2)
             high = round(hist.max(), 2)
-            ratio = round(price / high * 100, 1)  # 当前价格相对最高价比例 %
-            pct = get_percentile(hist, hist.iloc[-1])
+            ratio = round(price / high * 100, 1)
+            pct = get_percentile(hist, price)
             data[name] = {"price": price, "high": high, "ratio": ratio, "pct": pct}
-        except Exception:
+        except Exception as e:
+            print(f"获取 {name} 数据失败：{e}")
             data[name] = {"price": "获取失败", "high": None, "ratio": None, "pct": None}
     return data
 
 
 def fetch_multpl_data():
-    """获取 S&P500 的 PE 和 CAPE 数据"""
-    results = {}
+    """获取 S&P500 的 PE 和 CAPE 数据（带缓存和重试）"""
     urls = {
         "PE": "https://www.multpl.com/s-p-500-pe-ratio/table",
-        "CAPE": "https://www.multpl.com/shiller-pe/table"
+        "CAPE": "https://www.multpl.com/shiller-pe/table",
     }
+    results = {}
     for key, url in urls.items():
-        try:
-            r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
-            soup = BeautifulSoup(r.text, "html.parser")
-            table = soup.find("table", {"class": "datatable"})
-            history = []
-            if table:
-                rows = table.find_all("tr")[1:]
-                for row in rows:
-                    cols = row.find_all("td")
-                    if len(cols) >= 2:
-                        try:
-                            history.append(float(cols[1].text.strip().replace(",", "")))
-                        except:
-                            continue
-            if history:
-                value = round(history[0], 2)
-                series = pd.Series(history)
-                pct = get_percentile(series, value)
-                results[key] = {"val": value, "pct": pct}
-            else:
-                results[key] = {"val": "获取失败", "pct": None}
-        except Exception:
+        for attempt in range(3):
+            try:
+                r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+                soup = BeautifulSoup(r.text, "html.parser")
+                table = soup.find("table", {"class": "datatable"})
+                values = []
+                if table:
+                    for row in table.find_all("tr")[1:]:
+                        cols = row.find_all("td")
+                        if len(cols) >= 2:
+                            try:
+                                values.append(float(cols[1].text.strip().replace(",", "")))
+                            except:
+                                continue
+                if values:
+                    value = round(values[0], 2)
+                    series = pd.Series(values)
+                    pct = get_percentile(series, value)
+                    results[key] = {"val": value, "pct": pct}
+                    break
+            except Exception:
+                print(f"{key} 抓取失败，重试 {attempt+1}/3")
+                time.sleep(2)
+        else:
             results[key] = {"val": "获取失败", "pct": None}
+
+    # 若全部失败则读取缓存
+    if all(v["val"] == "获取失败" for v in results.values()):
+        if os.path.exists(CACHE_FILE):
+            with open(CACHE_FILE, "r") as f:
+                results = json.load(f)
+                print("使用缓存 multpl 数据")
+    else:
+        with open(CACHE_FILE, "w") as f:
+            json.dump(results, f)
     return results
 
 
-def send_wechat(content):
+def send_wechat(content, title="每日市场数据"):
     """推送到微信（Server酱）"""
     if not SEND_KEY:
         print("未设置 SERVER_CHAN_KEY，跳过推送")
         return
     url = f"https://sctapi.ftqq.com/{SEND_KEY}.send"
     try:
-        requests.post(url, data={
-            "title": "每日市场数据",
-            "desp": content
-        }, timeout=10)
-    except Exception:
-        print("微信推送失败")
+        r = requests.post(url, data={"title": title, "desp": content}, timeout=10)
+        print("推送状态：", r.status_code, r.text[:200])
+    except Exception as e:
+        print("微信推送失败：", e)
 
 
 def load_alerts():
-    """加载上次提醒状态"""
     if os.path.exists(ALERT_FILE):
-        with open(ALERT_FILE, "r") as f:
-            return json.load(f)
+        try:
+            with open(ALERT_FILE, "r") as f:
+                return json.load(f)
+        except Exception:
+            return {}
     return {}
 
 
 def save_alerts(alerts):
-    """保存提醒状态"""
-    with open(ALERT_FILE, "w") as f:
-        json.dump(alerts, f)
+    try:
+        with open(ALERT_FILE, "w") as f:
+            json.dump(alerts, f)
+    except Exception as e:
+        print("保存 alerts 失败：", e)
 
 
 def save_market_log(today, data):
-    """保存每日市场数据到 CSV"""
     fields = ["date", "SPY_price", "SPY_high", "SPY_ratio",
               "QQQ_price", "QQQ_high", "QQQ_ratio",
               "BTC_price", "BTC_high", "BTC_ratio",
               "VIX_price"]
-
     row = {
         "date": today,
         "SPY_price": data["SPY"]["price"],
@@ -129,77 +144,61 @@ def save_market_log(today, data):
         "BTC_ratio": data["BTC"]["ratio"],
         "VIX_price": data["VIX"]["price"],
     }
-
-    write_header = not os.path.exists(LOG_FILE)
-
-    with open(LOG_FILE, "a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fields)
-        if write_header:
-            writer.writeheader()
-        writer.writerow(row)
+    try:
+        write_header = not os.path.exists(LOG_FILE)
+        with open(LOG_FILE, "a", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fields)
+            if write_header:
+                writer.writeheader()
+            writer.writerow(row)
+    except Exception as e:
+        print("写入日志失败：", e)
 
 
 def format_pct(val):
-    """格式化百分比，如果是 None 返回空字符串"""
     return f"（{val:.1f}%）" if val is not None else ""
 
 
 if __name__ == "__main__":
-    today = datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=8))).strftime("%Y/%m/%d")
-    data = fetch_yahoo_data()
-    pe_data = fetch_multpl_data()
-    alerts = load_alerts()
+    try:
+        today = datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=8))).strftime("%Y/%m/%d")
+        data = fetch_yahoo_data()
+        pe_data = fetch_multpl_data()
+        alerts = load_alerts()
 
-    msg = f"**{today} 最新市场数据：**\n\n"
+        msg = f"**{today} 最新市场数据：**\n\n📈 **美股指数**\n"
+        for idx in ["SPY", "QQQ"]:
+            d = data[idx]
+            msg += f"- {idx}: {d['price']} (最高 {d['high']}, 当前/最高 {d['ratio']}%) {format_pct(d['pct'])}\n"
 
-    # ===== 美股 =====
-    msg += "📈 **美股指数**\n"
-    for idx in ["SPY", "QQQ"]:
-        price, high, ratio, pct = data[idx]["price"], data[idx]["high"], data[idx]["ratio"], data[idx]["pct"]
-        msg += f"- {idx}: {price if isinstance(price, str) else f'{price:.2f}'} (最高 {high if high else '-'} , 当前/最高 {ratio if ratio else '-'}%)"
-        msg += f" {format_pct(pct)}\n"
+        btc, vix = data["BTC"], data["VIX"]
+        msg += f"\n💰 **比特币**\n- BTC: {btc['price']} (最高 {btc['high']}, 当前/最高 {btc['ratio']}%) {format_pct(btc['pct'])}\n"
+        msg += f"\n🌪 **波动率指数**\n- VIX: {vix['price']}\n"
 
-    # ===== BTC =====
-    btc = data["BTC"]
-    msg += "\n💰 **比特币**\n"
-    msg += f"- BTC: {btc['price'] if isinstance(btc['price'], str) else f'{btc['price']:.2f}'} (最高 {btc['high'] if btc['high'] else '-'} , 当前/最高 {btc['ratio'] if btc['ratio'] else '-'}%)"
-    msg += f" {format_pct(btc['pct'])}\n"
+        msg += "\n📊 **估值指标**\n"
+        msg += f"- S&P500 PE: {pe_data['PE']['val']} {format_pct(pe_data['PE']['pct'])}\n"
+        msg += f"- S&P500 CAPE: {pe_data['CAPE']['val']} {format_pct(pe_data['CAPE']['pct'])}\n\n"
 
-    # ===== VIX =====
-    vix = data["VIX"]
-    msg += "\n🌪 **波动率指数**\n"
-    msg += f"- VIX: {vix['price'] if isinstance(vix['price'], str) else f'{vix['price']:.2f}'}\n"
+        # ---- 提醒逻辑修正 ----
+        alert_msg = ""
+        for key in ["SPY", "QQQ", "BTC"]:
+            ratio = data[key]["ratio"]
+            if ratio is None:
+                continue
+            last_alert = alerts.get(key, 105)
+            if ratio <= last_alert - 5:
+                alert_msg += f"⚠️ {key} 当前/最高比值跌破 {last_alert-5}%（现 {ratio:.1f}%）\n"
+                alerts[key] = ratio
 
-    # ===== 估值指标 =====
-    pe_val, pe_pct = pe_data['PE']["val"], pe_data['PE']["pct"]
-    cape_val, cape_pct = pe_data['CAPE']["val"], pe_data['CAPE']["pct"]
+        save_alerts(alerts)
+        if alert_msg:
+            send_wechat(alert_msg, title="价格提醒")
+            print("触发提醒：\n", alert_msg)
 
-    msg += "\n📊 **估值指标**\n"
-    msg += f"- S&P500 PE: {pe_val} {format_pct(pe_pct)}\n"
-    msg += f"- S&P500 CAPE: {cape_val} {format_pct(cape_pct)}\n\n"
-
-    # ===== 检查提醒条件 =====
-    alert_msg = ""
-    for key in ["SPY", "QQQ", "BTC"]:
-        ratio = data[key]["ratio"]
-        if not ratio:
-            continue
-        last_alert = alerts.get(key, 100)  # 默认100%
-        while ratio <= last_alert - 5:
-            alert_msg += f"⚠️ {key} 当前/最高比值跌破 {last_alert-5}%（现 {ratio:.1f}%）\n"
-            last_alert -= 5
-        alerts[key] = last_alert
-
-    save_alerts(alerts)
-
-    if alert_msg:
-        send_wechat("价格提醒：\n" + alert_msg)
-        print("触发提醒：\n" + alert_msg)
-
-    # ===== 正常每日数据推送 =====
-    msg += "📌 **数据来源**：https://www.multpl.com/"
-    send_wechat(msg)
-    print(msg)
-
-    # ===== 保存日志 =====
-    save_market_log(today, data)
+        msg += "📌 **数据来源**：Yahoo Finance / multpl.com"
+        send_wechat(msg)
+        save_market_log(today, data)
+        print("✅ 报告生成完成")
+    except Exception as e:
+        print("❌ 程序异常：", e)
+        print(traceback.format_exc())
