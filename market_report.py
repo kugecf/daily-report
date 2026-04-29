@@ -17,6 +17,7 @@ CACHE_FILE = "multpl_cache.json"
 
 
 def get_percentile(series, value):
+    """计算 value 在 series 中的分位数（百分比）"""
     try:
         return round((series < value).mean() * 100, 1)
     except Exception:
@@ -24,7 +25,7 @@ def get_percentile(series, value):
 
 
 def fetch_yahoo_data():
-    """获取 SPY / QQQ / BTC / VIX 历史价格、最新价格、最高价和比例"""
+    """获取 SPY / QQQ / BTC / VIX 历史价格、最新价格、最高价和比例（关闭自动复权）"""
     data = {}
     tickers = {
         "SPY": ("SPY", "10y"),
@@ -34,13 +35,18 @@ def fetch_yahoo_data():
     }
     for name, (ticker, period) in tickers.items():
         try:
-            tk = yf.Ticker(ticker)
-            hist = tk.history(period=period)["Close"]
+            # ⚠️ 关闭自动复权，使用真实收盘价
+            hist = yf.download(
+                ticker,
+                period=period,
+                auto_adjust=False,
+                progress=False
+            )["Close"].dropna()
             if hist.empty:
                 raise ValueError("empty data")
             price = round(hist.iloc[-1], 2)
             high = round(hist.max(), 2)
-            ratio = round(price / high * 100, 1)
+            ratio = round(price / high * 100, 1) if high != 0 else None
             pct = get_percentile(hist, price)
             data[name] = {"price": price, "high": high, "ratio": ratio, "pct": pct}
         except Exception as e:
@@ -50,40 +56,67 @@ def fetch_yahoo_data():
 
 
 def fetch_multpl_data():
-    """获取 S&P500 的 PE 和 CAPE 数据（带缓存和重试）"""
-    urls = {
-        "PE": "https://www.multpl.com/s-p-500-pe-ratio/table",
-        "CAPE": "https://www.multpl.com/shiller-pe/table",
-    }
-    results = {}
-    for key, url in urls.items():
-        for attempt in range(3):
-            try:
-                r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
-                soup = BeautifulSoup(r.text, "html.parser")
-                table = soup.find("table", {"class": "datatable"})
-                values = []
-                if table:
-                    for row in table.find_all("tr")[1:]:
-                        cols = row.find_all("td")
-                        if len(cols) >= 2:
-                            try:
-                                values.append(float(cols[1].text.strip().replace(",", "")))
-                            except:
-                                continue
-                if values:
-                    value = round(values[0], 2)
-                    series = pd.Series(values)
-                    pct = get_percentile(series, value)
-                    results[key] = {"val": value, "pct": pct}
-                    break
-            except Exception:
-                print(f"{key} 抓取失败，重试 {attempt+1}/3")
-                time.sleep(2)
-        else:
-            results[key] = {"val": "获取失败", "pct": None}
+    """
+    获取 S&P500 PE 和 CAPE 最新值 + 历史分位。
+    优先从 multpl 首页提取实时值，失败时回退到 pd.read_html 解析表格。
+    """
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    results = {"PE": {"val": "获取失败", "pct": None}, "CAPE": {"val": "获取失败", "pct": None}}
 
-    # 若全部失败则读取缓存
+    # ---------- 1. 尝试从首页提取最新值 ----------
+    try:
+        soup = BeautifulSoup(
+            requests.get("https://www.multpl.com", headers=headers, timeout=10).text,
+            "html.parser"
+        )
+        pe_elem = soup.select_one("#grid > a:nth-child(1) > div > div:nth-child(2)")
+        cape_elem = soup.select_one("#grid > a:nth-child(2) > div > div:nth-child(2)")
+
+        if pe_elem:
+            pe_text = pe_elem.get_text(strip=True).split()[0]
+            try:
+                results["PE"]["val"] = round(float(pe_text.replace(",", "")), 2)
+            except ValueError:
+                pass
+
+        if cape_elem:
+            cape_text = cape_elem.get_text(strip=True).split()[0]
+            try:
+                results["CAPE"]["val"] = round(float(cape_text.replace(",", "")), 2)
+            except ValueError:
+                pass
+
+        print(f"首页提取 PE={results['PE']['val']}, CAPE={results['CAPE']['val']}")
+    except Exception as e:
+        print(f"首页提取失败，将回退表格解析：{e}")
+
+    # ---------- 2. 获取月度历史表格计算分位 ----------
+    hist_urls = {
+        "PE": "https://www.multpl.com/s-p-500-pe-ratio/table/by-month",
+        "CAPE": "https://www.multpl.com/shiller-pe/table/by-month",
+    }
+    for key in hist_urls:
+        try:
+            tables = pd.read_html(hist_urls[key])
+            if tables and tables[0].shape[1] >= 2:
+                series = pd.to_numeric(tables[0].iloc[:, 1], errors='coerce').dropna()
+                if not series.empty:
+                    # 若首页提取值有效就用首页值，否则用历史序列最新值
+                    front_val = results[key]["val"]
+                    if front_val == "获取失败":
+                        front_val = round(series.iloc[0], 2)
+                        results[key]["val"] = front_val
+                    results[key]["pct"] = get_percentile(series, front_val)
+                else:
+                    print(f"{key} 历史序列为空")
+            else:
+                print(f"{key} 未发现有效表格")
+        except Exception as e:
+            print(f"{key} 历史数据抓取失败：{e}")
+            if results[key]["val"] != "获取失败":
+                results[key]["pct"] = None   # 虽无分位，仍保留值
+
+    # ---------- 3. 缓存逻辑 ----------
     if all(v["val"] == "获取失败" for v in results.values()):
         if os.path.exists(CACHE_FILE):
             with open(CACHE_FILE, "r") as f:
@@ -91,7 +124,8 @@ def fetch_multpl_data():
                 print("使用缓存 multpl 数据")
     else:
         with open(CACHE_FILE, "w") as f:
-            json.dump(results, f)
+            json.dump(results, f, indent=2)
+
     return results
 
 
@@ -166,6 +200,7 @@ if __name__ == "__main__":
         pe_data = fetch_multpl_data()
         alerts = load_alerts()
 
+        # 构建消息内容
         msg = f"**{today} 最新市场数据：**\n\n📈 **美股指数**\n"
         for idx in ["SPY", "QQQ"]:
             d = data[idx]
@@ -179,7 +214,7 @@ if __name__ == "__main__":
         msg += f"- S&P500 PE: {pe_data['PE']['val']} {format_pct(pe_data['PE']['pct'])}\n"
         msg += f"- S&P500 CAPE: {pe_data['CAPE']['val']} {format_pct(pe_data['CAPE']['pct'])}\n\n"
 
-        # ---- 提醒逻辑修正 ----
+        # 比率下跌提醒
         alert_msg = ""
         for key in ["SPY", "QQQ", "BTC"]:
             ratio = data[key]["ratio"]
@@ -195,7 +230,19 @@ if __name__ == "__main__":
             send_wechat(alert_msg, title="价格提醒")
             print("触发提醒：\n", alert_msg)
 
-        msg += "📌 **数据来源**：Yahoo Finance / multpl.com"
+        # 添加数据源引用链接（方便人工核实）
+        msg += (
+            "━━━━━━━━━━\n"
+            "📎 数据源（点击核实）\n"
+            "━━━━━━━━━━\n"
+            "• SPY：https://finance.yahoo.com/quote/SPY/\n"
+            "• QQQ：https://finance.yahoo.com/quote/QQQ/\n"
+            "• BTC：https://finance.yahoo.com/quote/BTC-USD/\n"
+            "• VIX：https://finance.yahoo.com/quote/%5EVIX/\n"
+            "• PE：https://www.multpl.com/s-p-500-pe-ratio\n"
+            "• CAPE：https://www.multpl.com/shiller-pe"
+        )
+
         send_wechat(msg)
         save_market_log(today, data)
         print("✅ 报告生成完成")
