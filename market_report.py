@@ -1,27 +1,17 @@
 import requests
 import pandas as pd
-from bs4 import BeautifulSoup
 from datetime import datetime, timezone, timedelta
-import os, json, csv, traceback, time
+import os, json, traceback, time
 
 SEND_KEY = os.environ.get("SERVER_CHAN_KEY")
 ALERT_FILE = "alerts.json"
-LOG_FILE = "market_log.csv"
 
-def safe_float(s):
-    try:
-        return float(str(s).replace(",", "").strip())
-    except:
-        return None
+# ATH threshold levels: drop % from all-time high
+DROP_THRESHOLDS = [10, 15, 20, 25]
 
-def get_percentile(series, value):
-    try:
-        return round((series < value).mean() * 100, 1)
-    except:
-        return None
 
-# ====== 1. Yahoo v8 API（稳定绕过限流） ======
-def yahoo_ohlcv(ticker, period="10y"):
+def yahoo_ohlcv(ticker, period="max"):
+    """Fetch OHLCV data from Yahoo Finance v8 API."""
     UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?range={period}&interval=1d"
     try:
@@ -30,122 +20,130 @@ def yahoo_ohlcv(ticker, period="10y"):
         js = r.json()["chart"]["result"][0]
         ts = js["timestamp"]
         q = js["indicators"]["quote"][0]
-        df = pd.DataFrame({"high": q["high"], "close": q["close"]}, index=pd.to_datetime(ts, unit="s")).dropna()
-        if df.empty: raise ValueError("empty")
-        last = df.iloc[-1]
-        return {"close": round(last["close"],2), "day_high": round(last["high"],2),
-                "hist_high": round(df["high"].max(),2), "date": df.index[-1].strftime("%Y-%m-%d"), "error": None}
+        df = pd.DataFrame({"close": q["close"]}, index=pd.to_datetime(ts, unit="s")).dropna()
+        if df.empty:
+            raise ValueError("empty data")
+        last_close = round(df["close"].iloc[-1], 2)
+        ath = round(df["close"].max(), 2)
+        pct_of_ath = round(last_close / ath * 100, 2)
+        return {
+            "close": last_close,
+            "ath": ath,
+            "pct_of_ath": pct_of_ath,
+            "date": df.index[-1].strftime("%Y-%m-%d"),
+            "error": None,
+        }
     except Exception as e:
-        return {"close": None, "day_high": None, "hist_high": None, "date": None, "error": str(e)}
+        return {"close": None, "ath": None, "pct_of_ath": None, "date": None, "error": str(e)}
 
-# ====== 2. BTC 免费稳定源：Coinlore（无限制） ======
-def coinlore_btc():
+
+def send_wechat(content, title="SPY/QQQ 浠锋牸棰勮"):
+    """Send alert via Server Chan (WeChat push)."""
+    if not SEND_KEY:
+        print("鈿?SERVER_CHAN_KEY not set, skipping notification")
+        return
     try:
-        r = requests.get("https://api.coinlore.net/api/ticker/?id=90", timeout=10)
-        data = r.json()
-        if data:
-            price = float(data[0]["price_usd"])
-            return {"price": round(price, 2), "error": None}
+        requests.post(
+            f"https://sctapi.ftqq.com/{SEND_KEY}.send",
+            data={"title": title, "desp": content},
+            timeout=10,
+        )
+        print("鉁?Alert sent via Server Chan")
     except Exception as e:
-        return {"price": None, "error": str(e)}
-    return {"price": None, "error": "No data"}
+        print(f"鉁?Failed to send alert: {e}")
 
-def coingecko_btc_historical():
-    url = "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart?vs_currency=usd&days=1825"
-    for _ in range(3):
-        try:
-            r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=20)
-            if r.status_code == 429:
-                time.sleep(60)
-                continue
-            prices = [p[1] for p in r.json().get("prices", [])]
-            if prices:
-                ser = pd.Series(prices)
-                return {"hist_high": round(ser.max(), 2), "error": None}
-        except:
-            time.sleep(5)
-    return {"hist_high": None, "error": "Failed"}
-
-# ====== 3. multpl PE/CAPE（直连 by-month 稳定页） ======
-def fetch_multpl_table(url, label):
-    headers = {"User-Agent": "Mozilla/5.0"}
-    for attempt in range(3):
-        try:
-            tables = pd.read_html(url)
-            if tables and tables[0].shape[1] >= 2:
-                vals = pd.to_numeric(tables[0].iloc[:,1].astype(str).str.replace(",",""), errors='coerce').dropna()
-                if not vals.empty:
-                    latest = round(vals.iloc[0], 2)
-                    pct = get_percentile(vals, latest)
-                    print(f"[{label}] 最新={latest}, 分位={pct}%")
-                    return latest, pct, vals
-        except Exception as e:
-            print(f"[{label}] 失败 {attempt+1}: {e}")
-            time.sleep(3)
-    return "获取失败", None, None
-
-# ====== 推送与存储 ======
-def send_wechat(content, title="每日市场交叉验证"):
-    if not SEND_KEY: return
-    requests.post(f"https://sctapi.ftqq.com/{SEND_KEY}.send", data={"title": title, "desp": content}, timeout=10)
 
 def load_alerts():
+    """Load persisted ATH and triggered threshold state."""
     if os.path.exists(ALERT_FILE):
-        with open(ALERT_FILE) as f: return json.load(f)
+        with open(ALERT_FILE) as f:
+            return json.load(f)
     return {}
 
+
 def save_alerts(d):
-    with open(ALERT_FILE, "w") as f: json.dump(d, f)
+    """Save ATH and triggered threshold state."""
+    with open(ALERT_FILE, "w") as f:
+        json.dump(d, f, indent=2)
+
+
+def check_and_alert(ticker, data, state):
+    """
+    Check if price drops below any threshold not yet alerted.
+    Returns True if an alert was sent.
+    """
+    if data["error"] or data["close"] is None:
+        print(f"鈿?{ticker}: data error, skipping alert check")
+        return False
+
+    ticker_state = state.get(ticker, {"ath": data["ath"], "triggered": []})
+
+    # Update ATH if new high is reached
+    if data["ath"] > ticker_state.get("ath", 0):
+        print(f"鈽?{ticker}: New ATH! {ticker_state.get('ath')} -> {data['ath']}")
+        ticker_state["ath"] = data["ath"]
+        # Reset ALL thresholds 鈥?new ATH means fresh cycle
+        ticker_state["triggered"] = []
+
+    # Calculate current drop % from ATH
+    ath = ticker_state["ath"]
+    if ath <= 0:
+        return False
+    drop_pct = round((1 - data["close"] / ath) * 100, 2)
+    triggered = ticker_state.get("triggered", [])
+
+    alerted = False
+    for threshold in DROP_THRESHOLDS:
+        if drop_pct >= threshold and threshold not in triggered:
+            # New threshold crossed 鈥?send alert
+            triggered.append(threshold)
+            msg = (
+                f"馃毃 {ticker} 浠锋牸棰勮\n\n"
+                f"褰撳墠浠锋牸: ${data['close']}\n"
+                f"鍘嗗彶鏈€楂?(ATH): ${ath}\n"
+                f"浠嶢TH涓嬭穼: **{drop_pct}%**\n"
+                f"瑙﹀彂闃堝€? {threshold}%\n"
+                f"褰撳墠涓篈TH鐨? {data['pct_of_ath']}%\n"
+                f"鏁版嵁鏃ユ湡: {data['date']}\n\n"
+                f"鈿?娉ㄦ剰: 浠锋牸宸蹭粠鏈€楂樼偣涓嬭穼瓒呰繃 {threshold}%"
+            )
+            send_wechat(msg, f"馃毃 {ticker} 浠锋牸涓嬭穼 {threshold}% 棰勮")
+            alerted = True
+            print(f"馃毃 {ticker}: threshold {threshold}% triggered (drop={drop_pct}%)")
+
+    # Update state
+    ticker_state["triggered"] = sorted(triggered)
+    state[ticker] = ticker_state
+    save_alerts(state)
+
+    if not alerted:
+        print(f"鉁?{ticker}: drop={drop_pct}%, thresholds triggered={triggered}")
+    return alerted
+
 
 if __name__ == "__main__":
     try:
-        today_str = datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=8))).strftime("%Y/%m/%d")
-        
-        # 1. 获取数据
+        print(f"=== Price Drop Monitor === {datetime.now().isoformat()}")
+
+        # Load persisted state
+        state = load_alerts()
+
+        # Fetch SPY and QQQ data
+        print("\nFetching SPY...")
         spy = yahoo_ohlcv("SPY")
+        print(f"  close={spy['close']}, ATH={spy['ath']}, %ofATH={spy['pct_of_ath']}%")
+
+        print("\nFetching QQQ...")
         qqq = yahoo_ohlcv("QQQ")
-        vix = yahoo_ohlcv("^VIX", "5y")
-        btc_now = coinlore_btc()
-        btc_hist = coingecko_btc_historical()
-        pe_val, pe_pct, _ = fetch_multpl_table("https://www.multpl.com/s-p-500-pe-ratio/table/by-month", "PE")
-        cape_val, cape_pct, _ = fetch_multpl_table("https://www.multpl.com/shiller-pe/table/by-month", "CAPE")
+        print(f"  close={qqq['close']}, ATH={qqq['ath']}, %ofATH={qqq['pct_of_ath']}%")
 
-        # 2. 构建报告
-        msg = f"**{today_str} 市场数据 · 多源交叉验证**\n（美股数据日期为前一交易日）\n\n"
-        
-        msg += f"**SPY**\n• 收盘价：Yahoo {spy['close']} (日期:{spy.get('date','?')})\n"
-        msg += f"• 日内最高：{spy['day_high']}（仅 Yahoo）\n"
-        msg += f"• 历史最高（Yahoo口径）：{spy['hist_high']}\n\n"
+        # Check alerts
+        print("\nChecking alert thresholds...")
+        check_and_alert("SPY", spy, state)
+        check_and_alert("QQQ", qqq, state)
 
-        msg += f"**QQQ**\n• 收盘价：Yahoo {qqq['close']} (日期:{qqq.get('date','?')})\n"
-        msg += f"• 日内最高：{qqq['day_high']}（仅 Yahoo）\n"
-        msg += f"• 历史最高（Yahoo口径）：{qqq['hist_high']}\n\n"
+        print("\n鉁?Monitor check complete")
 
-        msg += f"**BTC**\n• Coinlore实时价: {btc_now['price'] or '--'}\n"
-        msg += f"• 历史最高（CoinGecko收盘序列）：{btc_hist['hist_high'] or '--'}\n\n"
-
-        msg += f"**VIX**\n• Yahoo: {vix['close']} (日期:{vix.get('date','?')})\n\n"
-
-        msg += "**估值指标 (multpl.com)**\n"
-        msg += f"• PE: {pe_val} 分位({pe_pct}%)\n" if pe_val != "获取失败" else "• PE: 获取失败\n"
-        msg += f"• CAPE: {cape_val} 分位({cape_pct}%)\n" if cape_val != "获取失败" else "• CAPE: 获取失败\n"
-
-        # 数据源核实链接
-        msg += (
-            "\n━━━━━━━━━━\n"
-            "📎 数据源 (点击核实)\n"
-            "━━━━━━━━━━\n"
-            "• Yahoo SPY: https://finance.yahoo.com/quote/SPY\n"
-            "• Yahoo QQQ: https://finance.yahoo.com/quote/QQQ\n"
-            "• Coinlore BTC: https://www.coinlore.com/coin/bitcoin\n"
-            "• CoinGecko BTC History: https://www.coingecko.com/en/coins/bitcoin/historical_data\n"
-            "• multpl PE: https://www.multpl.com/s-p-500-pe-ratio/table/by-month\n"
-            "• multpl CAPE: https://www.multpl.com/shiller-pe/table/by-month"
-        )
-
-        send_wechat(msg)
-        print("✅ 报告生成完成")
-        
     except Exception as e:
-        print("❌ 全局异常:", e)
+        print(f"鉂?Global error: {e}")
         traceback.print_exc()
