@@ -1,1 +1,10 @@
-{"SPY": {"ath": 0, "triggered": []}, "QQQ": {"ath": 0, "triggered": []}}
+{
+  "SPY": {
+    "ath": 742.72,
+    "triggered": []
+  },
+  "QQQ": {
+    "ath": 714.51,
+    "triggered": []
+  }
+}
