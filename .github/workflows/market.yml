@@ -2,9 +2,9 @@ name: Price Drop Monitor
 
 on:
   schedule:
-    # Every 2 hours during US market hours (9:30-16:00 ET = 13:30-20:00 UTC)
-    # Run 14:00, 16:00, 18:00, 20:00 UTC (22:00, 00:00, 02:00, 04:00 Beijing)
-    - cron: '0 14,16,18,20 * * 1-5'
+    # Once daily at US market close (16:00 ET = 20:00 UTC)
+    # Mon-Fri only, avoids weekends and holidays via workflow_dispatch
+    - cron: '0 20 * * 1-5'
   workflow_dispatch:  # Manual trigger
 
 jobs:
