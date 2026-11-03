@@ -5,6 +5,8 @@
   },
   "QQQ": {
     "ath": 759.66,
-    "triggered": []
+    "triggered": [
+      10
+    ]
   }
 }
